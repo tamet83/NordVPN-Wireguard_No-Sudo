@@ -1,6 +1,6 @@
 # [Wireguard](https://www.wireguard.com) configuration file generator for a [NordVPN](https://nordvpn.com)
 
-I cloned the original repository because the provided script used the sudo command, which is not compatible with my Proxmox installation, and therefore it caused errors in the two lines of the script where the VPN encryption keys were supposed to be generated. The following steps are the same provided form the original repo.
+I cloned the original repository because the provided script used the sudo command, which is not compatible with my Proxmox installation, and therefore it caused errors in the two lines of the script where the VPN encryption keys were supposed to be generated. The following steps are the same provided form the original repo but is intended specifically for headless PC running for example Proxmox.
 
 A `bash` scripts that generates [Wireguard](https://www.wireguard.com) configuration file for a [NordVPN](https://nordvpn.com) connection.
 
