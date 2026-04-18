@@ -1,5 +1,7 @@
 # [Wireguard](https://www.wireguard.com) configuration file generator for a [NordVPN](https://nordvpn.com)
 
+I cloned the original repository because the provided script used the sudo command, which is not compatible with my Proxmox installation, and therefore it caused errors in the two lines of the script where the VPN encryption keys were supposed to be generated. The following steps are the same provided form the original repo.
+
 A `bash` scripts that generates [Wireguard](https://www.wireguard.com) configuration file for a [NordVPN](https://nordvpn.com) connection.
 
 ## INSTALL
@@ -10,10 +12,15 @@ This guide assumes the use of [Ubuntu](https://ubuntu.com). A similar install pr
 
 First let's clone this project so that you'll have the script on your target [Ubuntu](https://ubuntu.com) system.
 
+```
+git clone https://github.com/tamet83/NordVPN-Wireguard_No-Sudo.git
+
+```
+
 ### Install required packages
 
 ```bash
-sudo apt install wireguard curl jq net-tools
+apt install wireguard curl jq net-tools
 ```
 
 ### Install [NordVPN](https://nordvpn.com) client
@@ -41,12 +48,12 @@ The procedure differs if you have `MFA` enabled on your account:
    Back to the terminal
 
    ```bash
-   nordvpn login --callback "<The link you copied>"
+   nordvpn login --callback "The link you copied"
    ```
 
    And it will log you in.
 
-2. `MFA` is NOT ENABLED on your account
+2. `MFA` is NOT ENABLED on your account (This mode has been discontinued)
 
    Use `legacy` username and password to login.
 
@@ -61,7 +68,7 @@ The procedure differs if you have `MFA` enabled on your account:
 After a successful login, please set [NordVPN](https://nordvpn.com) to use `NordLynx` protocol.
 
 ```bash
-sudo nordvpn set technology nordlynx
+nordvpn set technology nordlynx
 ```
 
 ## Generate [Wireguard](https://www.wireguard.com) configuration files
@@ -70,6 +77,9 @@ The script is quite simple and can be run without parameters to generate a confi
 
 ```bash
 $ ./NordVpnToWireguard.sh
+```
+Result
+```
 Connect to NordVPN to gather connection parameters....
 Wireguard configuration file NordVPN-us1234.conf created successfully!
 ```
@@ -78,6 +88,9 @@ Requesting a specific country:
 
 ```bash
 $ ./NordVpnToWireguard.sh Canada
+```
+Result
+```
 Connect to NordVPN to gather connection parameters....
 Wireguard configuration file NordVPN-ca1234.conf created successfully!
 ```
@@ -86,6 +99,9 @@ Requesting a specific city
 
 ```bash
 $ ./NordVpnToWireguard.sh Berlin
+```
+Result
+```
 Connect to NordVPN to gather connection parameters....
 Wireguard configuration file NordVPN-de1234.conf created successfully!
 ```
@@ -94,6 +110,9 @@ Requesting a specific country and city
 
 ```bash
 $ ./NordVpnToWireguard.sh Japan Tokyo
+```
+Result
+```
 Connect to NordVPN to gather connection parameters....
 Wireguard configuration file NordVPN-jp1234.conf created successfully!
 ```
@@ -102,6 +121,9 @@ Requesting a specific server group
 
 ```bash
 $ ./NordVpnToWireguard.sh Double_VPN
+```
+Result
+```
 Connect to NordVPN to gather connection parameters....
 Wireguard configuration file NordVPN-ca-us1234.conf created successfully!
 ```
