@@ -43,8 +43,8 @@ fi
 
 # Gather all info
 MYIP=$($IP_ADDR_COMMAND nordlynx | grep inet | awk '{print $2}')/32
-PRIVATE=$(sudo wg show nordlynx private-key)
-PUBKEY=$(sudo wg show nordlynx | grep peer | awk '{print $2}')
+PRIVATE=$(wg show nordlynx private-key)
+PUBKEY=$(wg show nordlynx | grep peer | awk '{print $2}')
 ENDPOINT=$(nordvpn status | grep 'Hostname' | awk '{print $2}')
 OUTPUFILENAME="NordVPN-`echo $ENDPOINT | grep -o '^[^.]*'`.conf"
 
