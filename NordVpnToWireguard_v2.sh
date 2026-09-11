@@ -37,8 +37,11 @@ NordVPN WireGuard Config Generator v$VERSION
 Usage:
   $(basename "$0")
       Interactive mode: choose Standard or P2P, country and optionally city.
-      The script finds the least-loaded candidates, tests their latency and
-      generates a WireGuard configuration for the best server.
+      The script disconnects any active NordVPN tunnel before benchmarking,
+      finds the least-loaded candidates, tests their latency and generates a
+      WireGuard configuration for the best server. After connecting, it lets
+      you keep the NordVPN-assigned WireGuard address or change only its last
+      octet, and asks for the output filename.
 
   $(basename "$0") <country|server|country_code|city|group|country city>
       Legacy/direct mode. Arguments are passed directly to:
@@ -92,6 +95,21 @@ check_dependencies() {
 check_login() {
     if ! nordvpn account >/dev/null 2>&1; then
         die "NordVPN CLI is not logged in or its daemon is unavailable."
+    fi
+}
+
+ensure_disconnected_for_benchmark() {
+    local status
+    status="$(nordvpn status 2>/dev/null || true)"
+
+    if printf '%s\n' "$status" | grep -qi '^Status: Connected'; then
+        echo
+        echo "NordVPN connection detected."
+        echo "Disconnecting before server benchmark..."
+        if ! nordvpn disconnect >/dev/null 2>&1; then
+            die "Unable to disconnect NordVPN before latency tests."
+        fi
+        sleep 1
     fi
 }
 
@@ -364,6 +382,66 @@ get_tunnel_ip() {
     fi
 }
 
+
+prompt_output_filename() {
+    local default_name="$1"
+    local entered
+
+    echo
+    read -r -p "Output filename [${default_name}.conf]: " entered
+
+    if [ -z "$entered" ]; then
+        OUTPUT_FILENAME="${default_name}.conf"
+    else
+        entered="${entered##*/}"
+        case "$entered" in
+            *.conf) OUTPUT_FILENAME="$entered" ;;
+            *)      OUTPUT_FILENAME="${entered}.conf" ;;
+        esac
+    fi
+}
+
+choose_wireguard_address() {
+    local assigned="$1"
+    local base_ip prefix last_octet choice new_octet
+
+    base_ip="${assigned%/*}"
+    prefix="${assigned#*/}"
+    last_octet="${base_ip##*.}"
+
+    echo
+    echo "NordVPN assigned WireGuard address: $assigned"
+    echo "Do you want to use this address?"
+    echo "  1) Yes"
+    echo "  2) No, change only the last octet"
+
+    while true; do
+        read -r -p "Choice: " choice
+        case "$choice" in
+            1)
+                FINAL_WG_ADDRESS="$assigned"
+                return 0
+                ;;
+            2)
+                while true; do
+                    read -r -p "Enter new last octet (1-254) [current: $last_octet]: " new_octet
+                    if [[ "$new_octet" =~ ^[0-9]+$ ]] &&
+                       [ "$new_octet" -ge 1 ] &&
+                       [ "$new_octet" -le 254 ]; then
+                        FINAL_WG_ADDRESS="${base_ip%.*}.${new_octet}/${prefix}"
+                        echo "WireGuard address set to: $FINAL_WG_ADDRESS"
+                        return 0
+                    fi
+                    echo "Invalid value. Enter a number from 1 to 254."
+                done
+                ;;
+            *)
+                echo "Invalid choice."
+                ;;
+        esac
+    done
+}
+
 generate_config() {
     local connect_args=("$@")
 
@@ -377,7 +455,7 @@ generate_config() {
     # Give the interface/status a moment to settle.
     sleep 1
 
-    local myip private pubkey endpoint outputfilename
+    local myip private pubkey endpoint default_name
 
     myip="$(get_tunnel_ip)"
     private="$(wg show nordlynx private-key 2>/dev/null || true)"
@@ -389,15 +467,18 @@ generate_config() {
         die "Unable to gather all NordLynx/WireGuard parameters."
     fi
 
-    outputfilename="NordVPN-${endpoint%%.*}.conf"
+    choose_wireguard_address "$myip"
+
+    default_name="NordVPN-${endpoint%%.*}"
+    prompt_output_filename "$default_name"
 
     if ! nordvpn disconnect >/dev/null 2>&1; then
         die "Unable to disconnect from NordVPN after gathering parameters."
     fi
 
-    cat > "$outputfilename" <<EOF
+    cat > "$OUTPUT_FILENAME" <<EOF
 [Interface]
-Address = ${myip}
+Address = ${FINAL_WG_ADDRESS}
 PrivateKey = ${private}
 ListenPort = 51820
 DNS = 103.86.96.100, 103.86.99.100
@@ -409,10 +490,10 @@ Endpoint = ${endpoint}:51820
 PersistentKeepalive = 25
 EOF
 
-    chmod 600 "$outputfilename"
+    chmod 600 "$OUTPUT_FILENAME"
 
     echo
-    echo "WireGuard configuration file '$outputfilename' created successfully."
+    echo "WireGuard configuration file '$OUTPUT_FILENAME' created successfully."
 }
 
 main() {
@@ -431,6 +512,7 @@ main() {
     check_login
 
     if [ "$#" -eq 0 ]; then
+        ensure_disconnected_for_benchmark
         INTERACTIVE_SELECTED=""
         interactive_selection
         generate_config "$INTERACTIVE_SELECTED"
