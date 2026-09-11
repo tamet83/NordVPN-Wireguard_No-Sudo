@@ -60,8 +60,9 @@ Options:
 
 Interactive selection:
   Standard
-      Requires the "Standard VPN servers" group and excludes servers that are
-      also tagged P2P.
+      Requires the "Standard VPN servers" group. Servers may also support P2P;
+      only special categories such as Onion Over VPN, Double VPN and Dedicated IP
+      are excluded.
 
   P2P
       Requires the "P2P" group.
@@ -197,6 +198,9 @@ list_cities() {
             .[]
             | select(.status == "online")
             | select(any(.groups[]?; .title == "P2P"))
+            | select((any(.groups[]?; .title == "Onion Over VPN")) | not)
+            | select((any(.groups[]?; .title == "Double VPN")) | not)
+            | select((any(.groups[]?; .title == "Dedicated IP")) | not)
             | select(any(.locations[]?; .country.name == $country))
             | .locations[]?
             | select(.country.name == $country)
@@ -207,7 +211,9 @@ list_cities() {
             .[]
             | select(.status == "online")
             | select(any(.groups[]?; .title == "Standard VPN servers"))
-            | select((any(.groups[]?; .title == "P2P")) | not)
+            | select((any(.groups[]?; .title == "Onion Over VPN")) | not)
+            | select((any(.groups[]?; .title == "Double VPN")) | not)
+            | select((any(.groups[]?; .title == "Dedicated IP")) | not)
             | select(any(.locations[]?; .country.name == $country))
             | .locations[]?
             | select(.country.name == $country)
@@ -226,6 +232,9 @@ build_candidates() {
             .[]
             | select(.status == "online")
             | select(any(.groups[]?; .title == "P2P"))
+            | select((any(.groups[]?; .title == "Onion Over VPN")) | not)
+            | select((any(.groups[]?; .title == "Double VPN")) | not)
+            | select((any(.groups[]?; .title == "Dedicated IP")) | not)
             | select(any(.locations[]?;
                 .country.name == $country
                 and ($city == "" or (.country.city.name // "") == $city)
@@ -238,7 +247,9 @@ build_candidates() {
             .[]
             | select(.status == "online")
             | select(any(.groups[]?; .title == "Standard VPN servers"))
-            | select((any(.groups[]?; .title == "P2P")) | not)
+            | select((any(.groups[]?; .title == "Onion Over VPN")) | not)
+            | select((any(.groups[]?; .title == "Double VPN")) | not)
+            | select((any(.groups[]?; .title == "Dedicated IP")) | not)
             | select(any(.locations[]?;
                 .country.name == $country
                 and ($city == "" or (.country.city.name // "") == $city)
