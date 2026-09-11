@@ -10,9 +10,9 @@ PING_TIMEOUT=2
 
 # Optional UniFi UDM SE integration.
 # Override these with environment variables if your setup changes.
-UDM_HOST="${UDM_HOST:-192.168.2.1}"
+UDM_HOST="${UDM_HOST:-}"
 UDM_USER="${UDM_USER:-root}"
-UDM_SSH_KEY="${UDM_SSH_KEY:-/root/.ssh/id_ed25519_udm_nordvpn}"
+UDM_SSH_KEY="${UDM_SSH_KEY:-$HOME/.ssh/id_ed25519_udm_nordvpn}"
 UDM_CREDS_FILE="${UDM_CREDS_FILE:-/root/.unifi_nordvpn_api}"
 
 TMP_SERVERS=""
@@ -52,51 +52,71 @@ NordVPN WireGuard Config Generator v$VERSION
 
 Usage:
   $(basename "$0")
-      Interactive mode: choose Standard or P2P, country and optionally city.
-      The script disconnects any active NordVPN tunnel before benchmarking,
-      finds the least-loaded candidates, tests their latency and generates a
-      WireGuard configuration for the best server. After connecting, it lets
-      you keep the NordVPN-assigned WireGuard address or change only its last
-      octet, and asks for the output filename. The generated client address
-      is always written as /32, which is appropriate for the UniFi WireGuard
-      client profiles used by this script.
+      Start interactive mode.
 
-      After creating the file, the script can optionally connect to a UniFi
-      UDM SE, discover existing WireGuard VPN client profiles dynamically,
-      let you choose which one to update, back it up, replace its configuration,
-      reprovision it with disable/enable, and verify the runtime tunnel.
-
-  $(basename "$0") <country|server|country_code|city|group|country city>
-      Legacy/direct mode. Arguments are passed directly to:
-          nordvpn connect <arguments>
+  $(basename "$0") <NordVPN arguments>
+      Direct mode. Arguments are passed to "nordvpn connect".
 
 Examples:
-  $(basename "$0")
-  $(basename "$0") it462
+  $(basename "$0") it459
   $(basename "$0") Italy
   $(basename "$0") Italy Milan
-  $(basename "$0") P2P
+
+Interactive mode:
+
+  1) Generate WireGuard configuration only
+     - Select Standard or P2P
+     - Select country
+     - Optionally select city
+     - Benchmark the least-loaded candidate servers
+     - Generate a WireGuard .conf file
+
+  2) Generate configuration and update an existing UDM WireGuard profile
+     - Enter the UDM IP address or hostname, unless UDM_HOST is already set
+     - Discover existing WireGuard VPN Client profiles on the UDM
+     - Select the profile to update
+     - Preserve the current profile IP by default
+     - Select Standard or P2P
+     - Select country and optionally city
+     - Benchmark candidate servers
+     - Generate the new WireGuard configuration
+     - Back up the existing UniFi profile
+     - Update the same UniFi profile object
+     - Disable the profile and wait until the runtime wgcltX interface disappears
+     - Re-enable the profile
+     - Verify the runtime endpoint and WireGuard handshake
+
+Server selection:
+  - Only online NordVPN servers are considered
+  - Candidates are sorted by current NordVPN load
+  - The $TOP_CANDIDATES least-loaded candidates are tested with ping
+  - The server with the lowest average latency is selected
+  - Load is used as a tie-breaker
+  - Benchmarking is always performed outside an active NordVPN tunnel
+
+WireGuard address:
+  - Generated client addresses always use /32
+  - Generate-only mode proposes the NordVPN-assigned address
+  - UDM mode proposes the current address of the selected UDM profile
+  - The last IP octet can be changed manually
+
+UDM integration:
+  - UDM host can be entered interactively or provided with UDM_HOST
+  - SSH user defaults to: root
+  - SSH key defaults to: \$HOME/.ssh/id_ed25519_udm_nordvpn
+  - UniFi API credentials are read on the UDM from:
+      /root/.unifi_nordvpn_api
+  - No UDM password is stored in this script
+
+Requirements:
+  nordvpn, curl, jq, ping, wg, ip or ifconfig
+
+Additional requirements for UDM integration:
+  ssh, scp
 
 Options:
-  -h, --help       Show this help.
-  -v, --version    Show version.
-
-Interactive selection:
-  Standard
-      Requires the "Standard VPN servers" group. Servers may also support P2P;
-      only special categories such as Onion Over VPN, Double VPN and Dedicated IP
-      are excluded.
-
-  P2P
-      Requires the "P2P" group.
-
-Selection algorithm:
-  1. Keep only online servers in the selected country/city and category.
-  2. Sort by current NordVPN load.
-  3. Keep the $TOP_CANDIDATES least-loaded servers.
-  4. Ping each candidate $PING_COUNT times.
-  5. Choose the candidate with the lowest average latency.
-     Load is used as a tie-breaker.
+  -h, --help       Show this help
+  -v, --version    Show version
 EOF
 }
 
@@ -552,6 +572,23 @@ choose_wireguard_address() {
 }
 
 
+prompt_udm_host() {
+    if [ -n "$UDM_HOST" ]; then
+        echo
+        echo "Using UDM host from environment: $UDM_HOST"
+        return 0
+    fi
+
+    echo
+    while true; do
+        read -r -p "Enter UDM IP address or hostname: " UDM_HOST
+        if [ -n "$UDM_HOST" ]; then
+            return 0
+        fi
+        echo "UDM IP address or hostname cannot be empty."
+    done
+}
+
 udm_check_access() {
     command -v ssh >/dev/null 2>&1 || {
         echo "SSH client not found; UDM update is unavailable." >&2
@@ -566,6 +603,8 @@ udm_check_access() {
         echo "UDM SSH key not found: $UDM_SSH_KEY" >&2
         return 1
     }
+
+    echo "Checking SSH connection to UDM at $UDM_HOST..."
 
     if ! ssh -o BatchMode=yes -o ConnectTimeout=5 \
         -i "$UDM_SSH_KEY" "$UDM_USER@$UDM_HOST" \
@@ -838,6 +877,8 @@ REMOTE
 }
 
 select_udm_profile_for_update() {
+    prompt_udm_host
+
     if ! udm_check_access; then
         die "Unable to access the UDM SE. Cannot continue with UDM update mode."
     fi
