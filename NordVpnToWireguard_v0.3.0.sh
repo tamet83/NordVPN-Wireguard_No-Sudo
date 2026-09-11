@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+
+set -u
+
+VERSION="0.3.0"
+API_URL="https://api.nordvpn.com/v1/servers?limit=16384"
+TOP_CANDIDATES=10
+PING_COUNT=5
+PING_TIMEOUT=2
+
+TMP_SERVERS=""
+SELECTED_HOST=""
+SELECTED_SHORT=""
+SELECTED_LOAD=""
+SELECTED_PING=""
+
+cleanup() {
+    if [ -n "${TMP_SERVERS:-}" ] && [ -f "$TMP_SERVERS" ]; then
+        rm -f "$TMP_SERVERS"
+    fi
+}
+trap cleanup EXIT
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command '$1' was not found."
+}
+
+show_help() {
+    cat <<EOF
+NordVPN WireGuard Config Generator v$VERSION
+
+Usage:
+  $(basename "$0")
+      Interactive mode: choose Standard or P2P, country and optionally city.
+      The script finds the least-loaded candidates, tests their latency and
+      generates a WireGuard configuration for the best server.
+
+  $(basename "$0") <country|server|country_code|city|group|country city>
+      Legacy/direct mode. Arguments are passed directly to:
+          nordvpn connect <arguments>
+
+Examples:
+  $(basename "$0")
+  $(basename "$0") it462
+  $(basename "$0") Italy
+  $(basename "$0") Italy Milan
+  $(basename "$0") P2P
+
+Options:
+  -h, --help       Show this help.
+  -v, --version    Show version.
+
+Interactive selection:
+  Standard
+      Requires the "Standard VPN servers" group and excludes servers that are
+      also tagged P2P.
+
+  P2P
+      Requires the "P2P" group.
+
+Selection algorithm:
+  1. Keep only online servers in the selected country/city and category.
+  2. Sort by current NordVPN load.
+  3. Keep the $TOP_CANDIDATES least-loaded servers.
+  4. Ping each candidate $PING_COUNT times.
+  5. Choose the candidate with the lowest average latency.
+     Load is used as a tie-breaker.
+EOF
+}
+
+check_dependencies() {
+    require_cmd nordvpn
+    require_cmd curl
+    require_cmd jq
+    require_cmd ping
+    require_cmd wg
+
+    if command -v ip >/dev/null 2>&1; then
+        :
+    elif command -v ifconfig >/dev/null 2>&1; then
+        :
+    else
+        die "Neither 'ip' nor 'ifconfig' is installed."
+    fi
+}
+
+check_login() {
+    if ! nordvpn account >/dev/null 2>&1; then
+        die "NordVPN CLI is not logged in or its daemon is unavailable."
+    fi
+}
+
+fetch_servers() {
+    TMP_SERVERS="$(mktemp)"
+    echo "Downloading NordVPN server list..."
+    if ! curl -fsSL "$API_URL" -o "$TMP_SERVERS"; then
+        die "Unable to download NordVPN server data."
+    fi
+
+    if ! jq -e 'type == "array"' "$TMP_SERVERS" >/dev/null 2>&1; then
+        die "NordVPN API returned an unexpected response."
+    fi
+}
+
+choose_from_array() {
+    local prompt="$1"
+    shift
+    local items=("$@")
+    local choice
+
+    [ "${#items[@]}" -gt 0 ] || return 1
+
+    while true; do
+        echo
+        echo "$prompt"
+        local i
+        for ((i = 0; i < ${#items[@]}; i++)); do
+            printf "  %2d) %s\n" "$((i + 1))" "${items[$i]}"
+        done
+
+        read -r -p "Choice: " choice
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] &&
+           [ "$choice" -ge 1 ] &&
+           [ "$choice" -le "${#items[@]}" ]; then
+            printf '%s\n' "${items[$((choice - 1))]}"
+            return 0
+        fi
+
+        echo "Invalid choice."
+    done
+}
+
+choose_server_type() {
+    local choice
+
+    while true; do
+        echo
+        echo "Server type:"
+        echo "  1) Standard (non-P2P)"
+        echo "  2) P2P"
+        read -r -p "Choice: " choice
+
+        case "$choice" in
+            1)
+                printf '%s\n' "standard"
+                return 0
+                ;;
+            2)
+                printf '%s\n' "p2p"
+                return 0
+                ;;
+            *)
+                echo "Invalid choice."
+                ;;
+        esac
+    done
+}
+
+list_countries() {
+    jq -r '
+        .[]
+        | select(.status == "online")
+        | .locations[]?.country.name
+    ' "$TMP_SERVERS" | sort -fu
+}
+
+list_cities() {
+    local country="$1"
+    local mode="$2"
+
+    if [ "$mode" = "p2p" ]; then
+        jq -r --arg country "$country" '
+            .[]
+            | select(.status == "online")
+            | select(any(.groups[]?; .title == "P2P"))
+            | select(any(.locations[]?; .country.name == $country))
+            | .locations[]?
+            | select(.country.name == $country)
+            | .country.city.name // empty
+        ' "$TMP_SERVERS" | sort -fu
+    else
+        jq -r --arg country "$country" '
+            .[]
+            | select(.status == "online")
+            | select(any(.groups[]?; .title == "Standard VPN servers"))
+            | select((any(.groups[]?; .title == "P2P")) | not)
+            | select(any(.locations[]?; .country.name == $country))
+            | .locations[]?
+            | select(.country.name == $country)
+            | .country.city.name // empty
+        ' "$TMP_SERVERS" | sort -fu
+    fi
+}
+
+build_candidates() {
+    local country="$1"
+    local city="$2"
+    local mode="$3"
+
+    if [ "$mode" = "p2p" ]; then
+        jq -r --arg country "$country" --arg city "$city" '
+            .[]
+            | select(.status == "online")
+            | select(any(.groups[]?; .title == "P2P"))
+            | select(any(.locations[]?;
+                .country.name == $country
+                and ($city == "" or (.country.city.name // "") == $city)
+              ))
+            | [.hostname, (.load // 100)]
+            | @tsv
+        ' "$TMP_SERVERS"
+    else
+        jq -r --arg country "$country" --arg city "$city" '
+            .[]
+            | select(.status == "online")
+            | select(any(.groups[]?; .title == "Standard VPN servers"))
+            | select((any(.groups[]?; .title == "P2P")) | not)
+            | select(any(.locations[]?;
+                .country.name == $country
+                and ($city == "" or (.country.city.name // "") == $city)
+              ))
+            | [.hostname, (.load // 100)]
+            | @tsv
+        ' "$TMP_SERVERS"
+    fi
+}
+
+average_ping() {
+    local host="$1"
+    local result
+
+    result="$(
+        ping -n -c "$PING_COUNT" -W "$PING_TIMEOUT" "$host" 2>/dev/null |
+        awk -F'=' '/^(rtt|round-trip)/ {
+            gsub(/ /, "", $2)
+            split($2, a, "/")
+            print a[2]
+        }'
+    )"
+
+    if [ -n "$result" ]; then
+        printf '%s\n' "$result"
+    else
+        printf '%s\n' "999999"
+    fi
+}
+
+select_best_server() {
+    local country="$1"
+    local city="$2"
+    local mode="$3"
+
+    local candidates
+    candidates="$(
+        build_candidates "$country" "$city" "$mode" |
+        sort -t $'\t' -k2,2n |
+        head -n "$TOP_CANDIDATES"
+    )"
+
+    [ -n "$candidates" ] || die "No matching online servers were found."
+
+    echo
+    if [ "$mode" = "p2p" ]; then
+        printf "Testing P2P servers in %s" "$country"
+    else
+        printf "Testing Standard non-P2P servers in %s" "$country"
+    fi
+    [ -n "$city" ] && printf " / %s" "$city"
+    echo "..."
+    echo
+    printf "%-28s %8s %12s\n" "Server" "Load" "Avg ping"
+    printf "%-28s %8s %12s\n" "----------------------------" "--------" "------------"
+
+    local best_ping="999999"
+    local best_load="999"
+    local host load ping_ms
+
+    while IFS=$'\t' read -r host load; do
+        [ -n "$host" ] || continue
+
+        ping_ms="$(average_ping "$host")"
+
+        if [ "$ping_ms" = "999999" ]; then
+            printf "%-28s %7s%% %12s\n" "$host" "$load" "timeout"
+            continue
+        fi
+
+        printf "%-28s %7s%% %9s ms\n" "$host" "$load" "$ping_ms"
+
+        if awk -v p="$ping_ms" -v bp="$best_ping" -v l="$load" -v bl="$best_load" \
+            'BEGIN { exit !((p < bp) || (p == bp && l < bl)) }'; then
+            best_ping="$ping_ms"
+            best_load="$load"
+            SELECTED_HOST="$host"
+        fi
+    done <<< "$candidates"
+
+    [ -n "$SELECTED_HOST" ] || die "None of the candidate servers responded to ping."
+
+    SELECTED_SHORT="${SELECTED_HOST%%.*}"
+    SELECTED_LOAD="$best_load"
+    SELECTED_PING="$best_ping"
+
+    echo
+    echo "Selected server: $SELECTED_HOST"
+    echo "Load: ${SELECTED_LOAD}%"
+    echo "Average ping: ${SELECTED_PING} ms"
+}
+
+interactive_selection() {
+    fetch_servers
+
+    local mode
+    mode="$(choose_server_type)"
+
+    mapfile -t countries < <(list_countries)
+    [ "${#countries[@]}" -gt 0 ] || die "No countries were returned by the NordVPN API."
+
+    local country
+    country="$(choose_from_array "Select country:" "${countries[@]}")"
+
+    mapfile -t cities < <(list_cities "$country" "$mode")
+
+    local city=""
+    if [ "${#cities[@]}" -gt 0 ]; then
+        echo
+        read -r -p "Restrict the search to a city? [y/N]: " answer
+        case "${answer,,}" in
+            y|yes)
+                city="$(choose_from_array "Select city:" "${cities[@]}")"
+                ;;
+        esac
+    fi
+
+    select_best_server "$country" "$city" "$mode"
+    printf '%s\n' "$SELECTED_SHORT"
+}
+
+get_tunnel_ip() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 addr show dev nordlynx 2>/dev/null |
+            awk '/inet / {print $2; exit}'
+    else
+        ifconfig nordlynx 2>/dev/null |
+            awk '/inet / {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "inet") {
+                        print $(i + 1) "/32"
+                        exit
+                    }
+                }
+            }'
+    fi
+}
+
+generate_config() {
+    local connect_args=("$@")
+
+    echo
+    echo "Connecting to NordVPN to gather WireGuard parameters..."
+
+    if ! nordvpn connect "${connect_args[@]}"; then
+        die "Unable to connect to NordVPN."
+    fi
+
+    # Give the interface/status a moment to settle.
+    sleep 1
+
+    local myip private pubkey endpoint outputfilename
+
+    myip="$(get_tunnel_ip)"
+    private="$(wg show nordlynx private-key 2>/dev/null || true)"
+    pubkey="$(wg show nordlynx 2>/dev/null | awk '/^peer:/ {print $2; exit}')"
+    endpoint="$(nordvpn status | awk -F': ' '/^Hostname:/ {print $2; exit}')"
+
+    if [ -z "$myip" ] || [ -z "$private" ] || [ -z "$pubkey" ] || [ -z "$endpoint" ]; then
+        nordvpn disconnect >/dev/null 2>&1 || true
+        die "Unable to gather all NordLynx/WireGuard parameters."
+    fi
+
+    outputfilename="NordVPN-${endpoint%%.*}.conf"
+
+    if ! nordvpn disconnect >/dev/null 2>&1; then
+        die "Unable to disconnect from NordVPN after gathering parameters."
+    fi
+
+    cat > "$outputfilename" <<EOF
+[Interface]
+Address = ${myip}
+PrivateKey = ${private}
+ListenPort = 51820
+DNS = 103.86.96.100, 103.86.99.100
+
+[Peer]
+PublicKey = ${pubkey}
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = ${endpoint}:51820
+PersistentKeepalive = 25
+EOF
+
+    chmod 600 "$outputfilename"
+
+    echo
+    echo "WireGuard configuration file '$outputfilename' created successfully."
+}
+
+main() {
+    case "${1:-}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--version)
+            echo "Wireguard Config Files for NordVPN v$VERSION"
+            exit 0
+            ;;
+    esac
+
+    check_dependencies
+    check_login
+
+    if [ "$#" -eq 0 ]; then
+        local selected
+        selected="$(interactive_selection)"
+        generate_config "$selected"
+    else
+        # Backward-compatible/direct mode: pass arguments to NordVPN CLI.
+        generate_config "$@"
+    fi
+}
+
+main "$@"
