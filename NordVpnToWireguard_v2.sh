@@ -21,6 +21,15 @@ SELECTED_SHORT=""
 SELECTED_LOAD=""
 SELECTED_PING=""
 
+# Interactive workflow state
+OPERATION_MODE="generate"
+UDM_UPDATE_MODE="false"
+UDM_SELECTED_ID=""
+UDM_SELECTED_NAME=""
+UDM_SELECTED_IP=""
+UDM_SELECTED_WGID=""
+UDM_SELECTED_ENABLED=""
+
 cleanup() {
     if [ -n "${TMP_SERVERS:-}" ] && [ -f "$TMP_SERVERS" ]; then
         rm -f "$TMP_SERVERS"
@@ -166,6 +175,34 @@ choose_from_array() {
         fi
 
         echo "Invalid choice."
+    done
+}
+
+choose_operation_mode() {
+    local choice
+
+    while true; do
+        echo
+        echo "Operation:"
+        echo "  1) Generate WireGuard configuration only"
+        echo "  2) Generate configuration and update an existing UDM WireGuard profile"
+        read -r -p "Choice: " choice
+
+        case "$choice" in
+            1)
+                OPERATION_MODE="generate"
+                UDM_UPDATE_MODE="false"
+                return 0
+                ;;
+            2)
+                OPERATION_MODE="udm"
+                UDM_UPDATE_MODE="true"
+                return 0
+                ;;
+            *)
+                echo "Invalid choice."
+                ;;
+        esac
     done
 }
 
@@ -428,24 +465,69 @@ prompt_output_filename() {
 
 choose_wireguard_address() {
     local assigned="$1"
-    local base_ip last_octet choice new_octet
+    local assigned_base profile_base current_base last_octet choice new_octet
 
-    base_ip="${assigned%/*}"
-    last_octet="${base_ip##*.}"
+    assigned_base="${assigned%/*}"
+
+    if [ "$UDM_UPDATE_MODE" = "true" ] && [ -n "$UDM_SELECTED_IP" ]; then
+        profile_base="${UDM_SELECTED_IP%/*}"
+        current_base="$profile_base"
+        last_octet="${profile_base##*.}"
+
+        echo
+        echo "NordVPN assigned WireGuard address: $assigned"
+        echo
+        echo "Selected UDM profile: $UDM_SELECTED_NAME"
+        echo "Current UDM profile address: $UDM_SELECTED_IP"
+        echo
+        echo "Which address should be written to the new configuration?"
+        echo "  1) Keep current UDM profile address: ${profile_base}/32"
+        echo "  2) Change only the last octet"
+
+        while true; do
+            read -r -p "Choice: " choice
+            case "$choice" in
+                1)
+                    FINAL_WG_ADDRESS="${profile_base}/32"
+                    echo "WireGuard address set to: $FINAL_WG_ADDRESS"
+                    return 0
+                    ;;
+                2)
+                    while true; do
+                        read -r -p "Enter new last octet (1-254) [current: $last_octet]: " new_octet
+                        if [[ "$new_octet" =~ ^[0-9]+$ ]] &&
+                           [ "$new_octet" -ge 1 ] &&
+                           [ "$new_octet" -le 254 ]; then
+                            FINAL_WG_ADDRESS="${profile_base%.*}.${new_octet}/32"
+                            echo "WireGuard address set to: $FINAL_WG_ADDRESS"
+                            return 0
+                        fi
+                        echo "Invalid value. Enter a number from 1 to 254."
+                    done
+                    ;;
+                *)
+                    echo "Invalid choice."
+                    ;;
+            esac
+        done
+    fi
+
+    current_base="$assigned_base"
+    last_octet="${assigned_base##*.}"
 
     echo
     echo "NordVPN assigned WireGuard address: $assigned"
-    echo "The generated UniFi client configuration will use a /32 prefix."
+    echo "The generated configuration will use a /32 prefix."
     echo
-    echo "Do you want to keep the assigned IP address $base_ip?"
-    echo "  1) Yes"
-    echo "  2) No, change only the last octet"
+    echo "Which address should be written to the new configuration?"
+    echo "  1) Use NordVPN address: ${assigned_base}/32"
+    echo "  2) Change only the last octet"
 
     while true; do
         read -r -p "Choice: " choice
         case "$choice" in
             1)
-                FINAL_WG_ADDRESS="${base_ip}/32"
+                FINAL_WG_ADDRESS="${assigned_base}/32"
                 echo "WireGuard address set to: $FINAL_WG_ADDRESS"
                 return 0
                 ;;
@@ -455,7 +537,7 @@ choose_wireguard_address() {
                     if [[ "$new_octet" =~ ^[0-9]+$ ]] &&
                        [ "$new_octet" -ge 1 ] &&
                        [ "$new_octet" -le 254 ]; then
-                        FINAL_WG_ADDRESS="${base_ip%.*}.${new_octet}/32"
+                        FINAL_WG_ADDRESS="${assigned_base%.*}.${new_octet}/32"
                         echo "WireGuard address set to: $FINAL_WG_ADDRESS"
                         return 0
                     fi
@@ -666,10 +748,34 @@ api_put() {
 
 api_put "$UPDATED"
 
+IFACE=""
+if [ -n "$WG_ID" ]; then
+    IFACE="wgclt${WG_ID}"
+fi
+
 if [ "$ORIGINAL_ENABLED" = "true" ]; then
     jq '.enabled=false' "$UPDATED" > "$DISABLED"
     api_put "$DISABLED"
-    sleep 1
+
+    if [ -n "$IFACE" ]; then
+        echo "Waiting for runtime interface $IFACE to disappear..."
+        i=0
+        while wg show "$IFACE" >/dev/null 2>&1; do
+            sleep 1
+            i=$((i + 1))
+            if [ "$i" -ge 30 ]; then
+                echo "Error: $IFACE did not disappear within 30 seconds." >&2
+                echo "Re-enabling the UniFi profile before aborting..." >&2
+                api_put "$UPDATED"
+                exit 1
+            fi
+        done
+        echo "Runtime interface $IFACE has been removed."
+    else
+        echo "Warning: wireguard_id is unavailable; waiting 2 seconds before re-enabling." >&2
+        sleep 2
+    fi
+
     api_put "$UPDATED"
 fi
 
@@ -700,7 +806,7 @@ if [ -z "$WG_ID" ]; then
     exit 0
 fi
 
-IFACE="wgclt${WG_ID}"
+IFACE="${IFACE:-wgclt${WG_ID}}"
 HANDSHAKE="0"
 RUNTIME_ENDPOINT=""
 
@@ -731,32 +837,18 @@ fi
 REMOTE
 }
 
-prompt_udm_update() {
-    local answer
-    echo
-    read -r -p "Update an existing WireGuard VPN profile on the UDM SE? [y/N]: " answer
-
-    case "${answer,,}" in
-        y|yes) ;;
-        *) return 0 ;;
-    esac
-
+select_udm_profile_for_update() {
     if ! udm_check_access; then
-        echo "UDM update skipped."
-        return 0
+        die "Unable to access the UDM SE. Cannot continue with UDM update mode."
     fi
 
     local profiles_output
     if ! profiles_output="$(udm_list_wireguard_profiles)"; then
-        echo "Unable to retrieve WireGuard VPN profiles from the UDM." >&2
-        return 1
+        die "Unable to retrieve WireGuard VPN profiles from the UDM."
     fi
 
     mapfile -t profiles <<< "$profiles_output"
-    [ "${#profiles[@]}" -gt 0 ] || {
-        echo "No WireGuard VPN client profiles found on the UDM."
-        return 0
-    }
+    [ "${#profiles[@]}" -gt 0 ] || die "No WireGuard VPN client profiles found on the UDM."
 
     local ids=()
     local names=()
@@ -766,7 +858,7 @@ prompt_udm_update() {
     local line id name ip wgid enabled
 
     for line in "${profiles[@]}"; do
-        IFS=$'\t' read -r id name ip wgid enabled <<< "$line"
+        IFS=$'	' read -r id name ip wgid enabled <<< "$line"
         ids+=("$id")
         names+=("$name")
         ips+=("$ip")
@@ -778,9 +870,11 @@ prompt_udm_update() {
     echo "WireGuard VPN profiles found on UDM:"
     local i
     for ((i = 0; i < ${#names[@]}; i++)); do
-        printf "  %2d) %s [%s]\n" "$((i + 1))" "${names[$i]}" "${ips[$i]}"
+        printf "  %2d) %s [%s]
+" "$((i + 1))" "${names[$i]}" "${ips[$i]}"
     done
-    printf "  %2d) Cancel\n" "$(( ${#names[@]} + 1 ))"
+    printf "  %2d) Cancel
+" "$(( ${#names[@]} + 1 ))"
 
     local choice
     while true; do
@@ -795,35 +889,34 @@ prompt_udm_update() {
 
     if [ "$choice" -eq $(( ${#names[@]} + 1 )) ]; then
         echo "UDM update cancelled."
-        return 0
+        exit 0
     fi
 
     local idx=$((choice - 1))
-    local selected_id="${ids[$idx]}"
-    local selected_name="${names[$idx]}"
-    local selected_ip="${ips[$idx]}"
-    local generated_ip
+    UDM_SELECTED_ID="${ids[$idx]}"
+    UDM_SELECTED_NAME="${names[$idx]}"
+    UDM_SELECTED_IP="${ips[$idx]}"
+    UDM_SELECTED_WGID="${wgids[$idx]}"
+    UDM_SELECTED_ENABLED="${enableds[$idx]}"
 
+    echo
+    echo "Selected UDM profile: $UDM_SELECTED_NAME [$UDM_SELECTED_IP]"
+}
+
+update_selected_udm_profile() {
+    [ "$UDM_UPDATE_MODE" = "true" ] || return 0
+    [ -n "$UDM_SELECTED_ID" ] || die "No UDM profile has been selected."
+
+    local generated_ip
     generated_ip="$(awk -F' = ' '/^Address =/{print $2; exit}' "$OUTPUT_FILENAME")"
 
     echo
-    echo "Selected profile: $selected_name [$selected_ip]"
-    echo "Generated configuration address: $generated_ip"
-
-    if [ "$generated_ip" != "$selected_ip" ]; then
-        echo
-        echo "Warning: the generated address differs from the profile's current address."
-        read -r -p "Continue and change the profile address to $generated_ip? [y/N]: " answer
-        case "${answer,,}" in
-            y|yes) ;;
-            *)
-                echo "UDM update cancelled."
-                return 0
-                ;;
-        esac
-    fi
+    echo "UDM profile to update: $UDM_SELECTED_NAME"
+    echo "Current profile address: $UDM_SELECTED_IP"
+    echo "New configuration address: $generated_ip"
 
     local remote_conf="/tmp/nordvpn-wireguard-upload-$$.conf"
+
     echo
     echo "Uploading configuration to UDM..."
 
@@ -831,15 +924,14 @@ prompt_udm_update() {
         -i "$UDM_SSH_KEY" \
         "$OUTPUT_FILENAME" \
         "$UDM_USER@$UDM_HOST:$remote_conf"; then
-        echo "Unable to upload configuration to UDM." >&2
-        return 1
+        die "Unable to upload configuration to UDM."
     fi
 
-    echo "Updating UniFi profile '$selected_name'..."
+    echo "Updating UniFi profile '$UDM_SELECTED_NAME'..."
     if ! udm_apply_wireguard_profile \
-        "$selected_id" "$selected_name" "$remote_conf" "$(basename "$OUTPUT_FILENAME")"; then
-        echo "UDM profile update failed." >&2
-        return 1
+        "$UDM_SELECTED_ID" "$UDM_SELECTED_NAME" \
+        "$remote_conf" "$(basename "$OUTPUT_FILENAME")"; then
+        die "UDM profile update failed."
     fi
 }
 
@@ -896,7 +988,7 @@ EOF
     echo
     echo "WireGuard configuration file '$OUTPUT_FILENAME' created successfully."
 
-    prompt_udm_update
+    update_selected_udm_profile
 }
 
 main() {
@@ -915,12 +1007,25 @@ main() {
     check_login
 
     if [ "$#" -eq 0 ]; then
+        choose_operation_mode
+
+        if [ "$UDM_UPDATE_MODE" = "true" ]; then
+            # Select the destination profile first so its current IP can be
+            # proposed later when building the new WireGuard configuration.
+            select_udm_profile_for_update
+        fi
+
+        # Server benchmarking must always happen outside an active NordVPN tunnel.
         ensure_disconnected_for_benchmark
+
         INTERACTIVE_SELECTED=""
         interactive_selection
         generate_config "$INTERACTIVE_SELECTED"
     else
-        # Backward-compatible/direct mode: pass arguments to NordVPN CLI.
+        # Backward-compatible/direct mode:
+        # explicit NordVPN arguments generate a configuration only.
+        OPERATION_MODE="generate"
+        UDM_UPDATE_MODE="false"
         generate_config "$@"
     fi
 }
