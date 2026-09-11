@@ -8,6 +8,13 @@ TOP_CANDIDATES=10
 PING_COUNT=5
 PING_TIMEOUT=2
 
+# Optional UniFi UDM SE integration.
+# Override these with environment variables if your setup changes.
+UDM_HOST="${UDM_HOST:-192.168.2.1}"
+UDM_USER="${UDM_USER:-root}"
+UDM_SSH_KEY="${UDM_SSH_KEY:-/root/.ssh/id_ed25519_udm_nordvpn}"
+UDM_CREDS_FILE="${UDM_CREDS_FILE:-/root/.unifi_nordvpn_api}"
+
 TMP_SERVERS=""
 SELECTED_HOST=""
 SELECTED_SHORT=""
@@ -41,7 +48,14 @@ Usage:
       finds the least-loaded candidates, tests their latency and generates a
       WireGuard configuration for the best server. After connecting, it lets
       you keep the NordVPN-assigned WireGuard address or change only its last
-      octet, and asks for the output filename.
+      octet, and asks for the output filename. The generated client address
+      is always written as /32, which is appropriate for the UniFi WireGuard
+      client profiles used by this script.
+
+      After creating the file, the script can optionally connect to a UniFi
+      UDM SE, discover existing WireGuard VPN client profiles dynamically,
+      let you choose which one to update, back it up, replace its configuration,
+      reprovision it with disable/enable, and verify the runtime tunnel.
 
   $(basename "$0") <country|server|country_code|city|group|country city>
       Legacy/direct mode. Arguments are passed directly to:
@@ -414,15 +428,16 @@ prompt_output_filename() {
 
 choose_wireguard_address() {
     local assigned="$1"
-    local base_ip prefix last_octet choice new_octet
+    local base_ip last_octet choice new_octet
 
     base_ip="${assigned%/*}"
-    prefix="${assigned#*/}"
     last_octet="${base_ip##*.}"
 
     echo
     echo "NordVPN assigned WireGuard address: $assigned"
-    echo "Do you want to use this address?"
+    echo "The generated UniFi client configuration will use a /32 prefix."
+    echo
+    echo "Do you want to keep the assigned IP address $base_ip?"
     echo "  1) Yes"
     echo "  2) No, change only the last octet"
 
@@ -430,7 +445,8 @@ choose_wireguard_address() {
         read -r -p "Choice: " choice
         case "$choice" in
             1)
-                FINAL_WG_ADDRESS="$assigned"
+                FINAL_WG_ADDRESS="${base_ip}/32"
+                echo "WireGuard address set to: $FINAL_WG_ADDRESS"
                 return 0
                 ;;
             2)
@@ -439,7 +455,7 @@ choose_wireguard_address() {
                     if [[ "$new_octet" =~ ^[0-9]+$ ]] &&
                        [ "$new_octet" -ge 1 ] &&
                        [ "$new_octet" -le 254 ]; then
-                        FINAL_WG_ADDRESS="${base_ip%.*}.${new_octet}/${prefix}"
+                        FINAL_WG_ADDRESS="${base_ip%.*}.${new_octet}/32"
                         echo "WireGuard address set to: $FINAL_WG_ADDRESS"
                         return 0
                     fi
@@ -451,6 +467,380 @@ choose_wireguard_address() {
                 ;;
         esac
     done
+}
+
+
+udm_check_access() {
+    command -v ssh >/dev/null 2>&1 || {
+        echo "SSH client not found; UDM update is unavailable." >&2
+        return 1
+    }
+    command -v scp >/dev/null 2>&1 || {
+        echo "SCP client not found; UDM update is unavailable." >&2
+        return 1
+    }
+
+    [ -f "$UDM_SSH_KEY" ] || {
+        echo "UDM SSH key not found: $UDM_SSH_KEY" >&2
+        return 1
+    }
+
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$UDM_SSH_KEY" "$UDM_USER@$UDM_HOST" \
+        "test -r '$UDM_CREDS_FILE' && command -v curl >/dev/null && command -v jq >/dev/null && command -v wg >/dev/null"; then
+        echo "Unable to access the UDM or required UDM tools/credentials are missing." >&2
+        return 1
+    fi
+}
+
+udm_list_wireguard_profiles() {
+    ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$UDM_SSH_KEY" "$UDM_USER@$UDM_HOST" \
+        bash -s -- "$UDM_CREDS_FILE" <<'REMOTE'
+set -eu
+CREDS_FILE="$1"
+COOKIE="$(mktemp)"
+HEADERS="$(mktemp)"
+trap 'rm -f "$COOKIE" "$HEADERS"' EXIT
+
+U="$(sed -n '1p' "$CREDS_FILE")"
+P="$(sed -n '2p' "$CREDS_FILE")"
+PAYLOAD="$(jq -nc --arg username "$U" --arg password "$P" \
+    '{username:$username,password:$password}')"
+
+CODE="$(curl -sk -D "$HEADERS" -c "$COOKIE" \
+    -H 'Content-Type: application/json' \
+    -d "$PAYLOAD" \
+    -o /dev/null -w '%{http_code}' \
+    https://127.0.0.1/api/auth/login)"
+
+[ "$CODE" = "200" ] || {
+    echo "UniFi API login failed with HTTP $CODE" >&2
+    exit 1
+}
+
+curl -sk -b "$COOKIE" \
+    https://127.0.0.1/proxy/network/api/s/default/rest/networkconf |
+jq -r '
+    .data[]
+    | select(.purpose == "vpn-client" and .vpn_type == "wireguard-client")
+    | [
+        ._id,
+        .name,
+        (.ip_subnet // ""),
+        (.wireguard_id // ""),
+        (.enabled // false)
+      ]
+    | @tsv
+'
+REMOTE
+}
+
+udm_apply_wireguard_profile() {
+    local profile_id="$1"
+    local profile_name="$2"
+    local remote_conf="$3"
+    local config_filename="$4"
+
+    ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$UDM_SSH_KEY" "$UDM_USER@$UDM_HOST" \
+        bash -s -- \
+        "$UDM_CREDS_FILE" "$profile_id" "$profile_name" \
+        "$remote_conf" "$config_filename" <<'REMOTE'
+set -eu
+umask 077
+
+CREDS_FILE="$1"
+PROFILE_ID="$2"
+PROFILE_NAME="$3"
+CONFIG_PATH="$4"
+CONFIG_FILENAME="$5"
+
+COOKIE="$(mktemp)"
+HEADERS="$(mktemp)"
+CURRENT="$(mktemp)"
+UPDATED="$(mktemp)"
+DISABLED="$(mktemp)"
+PUT_BODY="$(mktemp)"
+
+cleanup() {
+    rm -f "$COOKIE" "$HEADERS" "$CURRENT" "$UPDATED" "$DISABLED" "$PUT_BODY"
+    rm -f "$CONFIG_PATH"
+}
+trap cleanup EXIT
+
+U="$(sed -n '1p' "$CREDS_FILE")"
+P="$(sed -n '2p' "$CREDS_FILE")"
+PAYLOAD="$(jq -nc --arg username "$U" --arg password "$P" \
+    '{username:$username,password:$password}')"
+
+LOGIN_CODE="$(curl -sk -D "$HEADERS" -c "$COOKIE" \
+    -H 'Content-Type: application/json' \
+    -d "$PAYLOAD" \
+    -o /dev/null -w '%{http_code}' \
+    https://127.0.0.1/api/auth/login)"
+
+[ "$LOGIN_CODE" = "200" ] || {
+    echo "Error: UniFi API login failed with HTTP $LOGIN_CODE." >&2
+    exit 1
+}
+
+CSRF="$(awk -F': ' 'tolower($1)=="x-csrf-token" {gsub("\\r","",$2); print $2}' "$HEADERS")"
+[ -n "$CSRF" ] || {
+    echo "Error: UniFi API did not return a CSRF token." >&2
+    exit 1
+}
+
+GET_CODE="$(curl -sk -b "$COOKIE" \
+    -o "$PUT_BODY" -w '%{http_code}' \
+    "https://127.0.0.1/proxy/network/api/s/default/rest/networkconf/$PROFILE_ID")"
+
+[ "$GET_CODE" = "200" ] || {
+    echo "Error: unable to read UniFi profile (HTTP $GET_CODE)." >&2
+    exit 1
+}
+
+jq '.data[0]' "$PUT_BODY" > "$CURRENT"
+
+[ "$(jq -r '.vpn_type' "$CURRENT")" = "wireguard-client" ] || {
+    echo "Error: selected profile is not a WireGuard client." >&2
+    exit 1
+}
+
+ACTUAL_NAME="$(jq -r '.name' "$CURRENT")"
+[ "$ACTUAL_NAME" = "$PROFILE_NAME" ] || {
+    echo "Error: profile name changed while updating." >&2
+    exit 1
+}
+
+ADDRESS="$(awk -F' = ' '/^Address =/{print $2; exit}' "$CONFIG_PATH")"
+ENDPOINT="$(awk -F' = ' '/^Endpoint =/{print $2; exit}' "$CONFIG_PATH")"
+
+[ -n "$ADDRESS" ] && [ -n "$ENDPOINT" ] || {
+    echo "Error: Address or Endpoint missing from WireGuard configuration." >&2
+    exit 1
+}
+
+case "$ADDRESS" in
+    */32) ;;
+    *)
+        echo "Error: UniFi WireGuard client address must use /32; got $ADDRESS." >&2
+        exit 1
+        ;;
+esac
+
+SAFE_NAME="$(printf '%s' "$ACTUAL_NAME" | tr -cs 'A-Za-z0-9._-' '_')"
+BACKUP="/root/nordvpn-wireguard-${SAFE_NAME}-$(date +%Y%m%d-%H%M%S).json"
+cp "$CURRENT" "$BACKUP"
+chmod 600 "$BACKUP"
+
+ORIGINAL_ENABLED="$(jq -r '.enabled // false' "$CURRENT")"
+WG_ID="$(jq -r '.wireguard_id // empty' "$CURRENT")"
+
+jq --rawfile conf "$CONFIG_PATH" \
+   --arg filename "$CONFIG_FILENAME" \
+   --arg ip "$ADDRESS" \
+   '.wireguard_client_configuration_file=$conf
+    | .wireguard_client_configuration_filename=$filename
+    | .ip_subnet=$ip' \
+   "$CURRENT" > "$UPDATED"
+
+api_put() {
+    local json_file="$1"
+    local code
+
+    code="$(curl -sk -X PUT \
+        -b "$COOKIE" \
+        -H "X-CSRF-Token: $CSRF" \
+        -H 'Content-Type: application/json' \
+        --data-binary @"$json_file" \
+        -o "$PUT_BODY" -w '%{http_code}' \
+        "https://127.0.0.1/proxy/network/api/s/default/rest/networkconf/$PROFILE_ID")"
+
+    [ "$code" = "200" ] || {
+        echo "Error: UniFi profile update failed with HTTP $code." >&2
+        cat "$PUT_BODY" >&2
+        exit 1
+    }
+}
+
+api_put "$UPDATED"
+
+if [ "$ORIGINAL_ENABLED" = "true" ]; then
+    jq '.enabled=false' "$UPDATED" > "$DISABLED"
+    api_put "$DISABLED"
+    sleep 1
+    api_put "$UPDATED"
+fi
+
+STORED="$(curl -sk -b "$COOKIE" \
+    "https://127.0.0.1/proxy/network/api/s/default/rest/networkconf/$PROFILE_ID")"
+
+STORED_FILENAME="$(printf '%s' "$STORED" | jq -r '.data[0].wireguard_client_configuration_filename')"
+STORED_IP="$(printf '%s' "$STORED" | jq -r '.data[0].ip_subnet')"
+STORED_ENDPOINT="$(printf '%s' "$STORED" |
+    jq -r '.data[0].wireguard_client_configuration_file
+        | capture("Endpoint = (?<e>[^\\n]+)").e')"
+
+echo
+echo "UniFi profile updated successfully."
+echo "Profile: $ACTUAL_NAME"
+echo "Backup: $BACKUP"
+echo "Configuration file: $STORED_FILENAME"
+echo "Address: $STORED_IP"
+echo "Stored endpoint: $STORED_ENDPOINT"
+
+if [ "$ORIGINAL_ENABLED" != "true" ]; then
+    echo "Profile was disabled before the update and has been left disabled."
+    exit 0
+fi
+
+if [ -z "$WG_ID" ]; then
+    echo "Warning: unable to determine the runtime WireGuard interface ID."
+    exit 0
+fi
+
+IFACE="wgclt${WG_ID}"
+HANDSHAKE="0"
+RUNTIME_ENDPOINT=""
+
+i=0
+while [ "$i" -lt 15 ]; do
+    if wg show "$IFACE" >/dev/null 2>&1; then
+        RUNTIME_ENDPOINT="$(wg show "$IFACE" endpoints 2>/dev/null | awk 'NR==1 {print $2}')"
+        HANDSHAKE="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}')"
+        [ -n "$HANDSHAKE" ] || HANDSHAKE="0"
+        if [ "$HANDSHAKE" -gt 0 ] 2>/dev/null; then
+            break
+        fi
+    fi
+    sleep 1
+    i=$((i + 1))
+done
+
+echo "Runtime interface: $IFACE"
+[ -n "$RUNTIME_ENDPOINT" ] && echo "Runtime endpoint: $RUNTIME_ENDPOINT"
+
+if [ "$HANDSHAKE" -gt 0 ] 2>/dev/null; then
+    NOW="$(date +%s)"
+    AGE=$((NOW - HANDSHAKE))
+    echo "WireGuard handshake: active (${AGE}s ago)"
+else
+    echo "Warning: no WireGuard handshake detected yet."
+fi
+REMOTE
+}
+
+prompt_udm_update() {
+    local answer
+    echo
+    read -r -p "Update an existing WireGuard VPN profile on the UDM SE? [y/N]: " answer
+
+    case "${answer,,}" in
+        y|yes) ;;
+        *) return 0 ;;
+    esac
+
+    if ! udm_check_access; then
+        echo "UDM update skipped."
+        return 0
+    fi
+
+    local profiles_output
+    if ! profiles_output="$(udm_list_wireguard_profiles)"; then
+        echo "Unable to retrieve WireGuard VPN profiles from the UDM." >&2
+        return 1
+    fi
+
+    mapfile -t profiles <<< "$profiles_output"
+    [ "${#profiles[@]}" -gt 0 ] || {
+        echo "No WireGuard VPN client profiles found on the UDM."
+        return 0
+    }
+
+    local ids=()
+    local names=()
+    local ips=()
+    local wgids=()
+    local enableds=()
+    local line id name ip wgid enabled
+
+    for line in "${profiles[@]}"; do
+        IFS=$'\t' read -r id name ip wgid enabled <<< "$line"
+        ids+=("$id")
+        names+=("$name")
+        ips+=("$ip")
+        wgids+=("$wgid")
+        enableds+=("$enabled")
+    done
+
+    echo
+    echo "WireGuard VPN profiles found on UDM:"
+    local i
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        printf "  %2d) %s [%s]\n" "$((i + 1))" "${names[$i]}" "${ips[$i]}"
+    done
+    printf "  %2d) Cancel\n" "$(( ${#names[@]} + 1 ))"
+
+    local choice
+    while true; do
+        read -r -p "Select profile to update: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] &&
+           [ "$choice" -ge 1 ] &&
+           [ "$choice" -le $(( ${#names[@]} + 1 )) ]; then
+            break
+        fi
+        echo "Invalid choice."
+    done
+
+    if [ "$choice" -eq $(( ${#names[@]} + 1 )) ]; then
+        echo "UDM update cancelled."
+        return 0
+    fi
+
+    local idx=$((choice - 1))
+    local selected_id="${ids[$idx]}"
+    local selected_name="${names[$idx]}"
+    local selected_ip="${ips[$idx]}"
+    local generated_ip
+
+    generated_ip="$(awk -F' = ' '/^Address =/{print $2; exit}' "$OUTPUT_FILENAME")"
+
+    echo
+    echo "Selected profile: $selected_name [$selected_ip]"
+    echo "Generated configuration address: $generated_ip"
+
+    if [ "$generated_ip" != "$selected_ip" ]; then
+        echo
+        echo "Warning: the generated address differs from the profile's current address."
+        read -r -p "Continue and change the profile address to $generated_ip? [y/N]: " answer
+        case "${answer,,}" in
+            y|yes) ;;
+            *)
+                echo "UDM update cancelled."
+                return 0
+                ;;
+        esac
+    fi
+
+    local remote_conf="/tmp/nordvpn-wireguard-upload-$$.conf"
+    echo
+    echo "Uploading configuration to UDM..."
+
+    if ! scp -q -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$UDM_SSH_KEY" \
+        "$OUTPUT_FILENAME" \
+        "$UDM_USER@$UDM_HOST:$remote_conf"; then
+        echo "Unable to upload configuration to UDM." >&2
+        return 1
+    fi
+
+    echo "Updating UniFi profile '$selected_name'..."
+    if ! udm_apply_wireguard_profile \
+        "$selected_id" "$selected_name" "$remote_conf" "$(basename "$OUTPUT_FILENAME")"; then
+        echo "UDM profile update failed." >&2
+        return 1
+    fi
 }
 
 generate_config() {
@@ -505,6 +895,8 @@ EOF
 
     echo
     echo "WireGuard configuration file '$OUTPUT_FILENAME' created successfully."
+
+    prompt_udm_update
 }
 
 main() {
