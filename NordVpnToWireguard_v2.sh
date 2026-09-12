@@ -830,18 +830,21 @@ STORED_ENDPOINT="$(printf '%s' "$STORED" |
 echo
 echo "UniFi profile updated successfully."
 echo "Profile: $ACTUAL_NAME"
-echo "Backup: $BACKUP"
 echo "Configuration file: $STORED_FILENAME"
 echo "Address: $STORED_IP"
 echo "Stored endpoint: $STORED_ENDPOINT"
 
 if [ "$ORIGINAL_ENABLED" != "true" ]; then
     echo "Profile was disabled before the update and has been left disabled."
+    rm -f "$BACKUP"
+    echo "Temporary backup removed."
     exit 0
 fi
 
 if [ -z "$WG_ID" ]; then
     echo "Warning: unable to determine the runtime WireGuard interface ID."
+    echo "Runtime verification could not be completed."
+    echo "Backup preserved: $BACKUP"
     exit 0
 fi
 
@@ -870,8 +873,11 @@ if [ "$HANDSHAKE" -gt 0 ] 2>/dev/null; then
     NOW="$(date +%s)"
     AGE=$((NOW - HANDSHAKE))
     echo "WireGuard handshake: active (${AGE}s ago)"
+    rm -f "$BACKUP"
+    echo "Temporary backup removed."
 else
     echo "Warning: no WireGuard handshake detected yet."
+    echo "Backup preserved: $BACKUP"
 fi
 REMOTE
 }
